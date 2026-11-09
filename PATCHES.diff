@@ -1,0 +1,518 @@
+# Correções locais sobre o karlseguin/http.zig master (commit 1bb71ff128a044b1645df91046473c38abbf965c); ver PATCHES.md.
+diff --git a/src/config.zig b/src/config.zig
+index 49005b4..24270f9 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -9,6 +9,9 @@ const Io = std.Io;
+ 
+ pub const Config = struct {
+     address: Address = .localhost(5882),
++    // An already bound and listening socket (e.g. kept by systemd across restarts). When set, `address` is not
++    // bound; the server takes the socket over, makes it non-blocking and closes it on stop.
++    listener: ?std.posix.fd_t = null,
+     workers: Worker = .{},
+     request: Request = .{},
+     response: Response = .{},
+diff --git a/src/httpz.zig b/src/httpz.zig
+index 11f062b..3de718b 100644
+--- a/src/httpz.zig
++++ b/src/httpz.zig
+@@ -263,6 +263,9 @@ pub fn Server(comptime H: type) type {
+         _workers: []Worker,
+         _cond: Io.Condition,
+         _listener: ?posix.fd_t,
++        // Set by gracefulStop(): workers stop accepting and every response closes its connection.
++        _draining: std.atomic.Value(bool) = .init(false),
++        _drain_grace_s: u32 = 0,
+         _max_request_per_connection: usize,
+         _middlewares: []const Middleware(H),
+         _websocket_state: websocket.server.WorkerState,
+@@ -353,41 +356,17 @@ pub fn Server(comptime H: type) type {
+             errdefer self._mut.unlock(io);
+ 
+             const config = self.config;
+-            const address = try config.address.toPosix(io);
+-            const is_unix_socket = address.any.family == posix.AF.UNIX;
+-
+-            const listener = blk: {
+-                var sock_flags: u32 = posix.SOCK.STREAM | posix.CLOEXEC;
+-                if (blockingMode() == false) sock_flags |= posix.NONBLOCK;
+-
+-                const proto = if (is_unix_socket) @as(u32, 0) else posix.IPPROTO.TCP;
+-                break :blk try posix.socket(address.any.family, sock_flags, proto);
+-            };
+-
+-            errdefer {
+-                posix.close(listener);
+-                self._listener = null;
+-            }
+-
+-            if (is_unix_socket == false) {
+-                try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+-            }
+-
+-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+-
+-            if (is_unix_socket == false and self._workers.len > 1) {
+-                if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
+-                    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
+-                } else if (@hasDecl(posix.SO, "REUSEPORT")) {
+-                    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
++            const listener = if (config.listener) |fd| blk: {
++                const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
++                const nonblock: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
++                if (blockingMode()) {
++                    _ = try posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock);
++                } else {
++                    _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock);
+                 }
+-            }
+-
+-            {
+-                const socklen = address.getOsSockLen();
+-                try posix.bind(listener, &address.any, socklen);
+-                try posix.listen(listener, 1024); // kernel backlog
+-            }
++                _ = try posix.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
++                break :blk fd;
++            } else try self.bindListener(io);
+ 
+             self._listener = listener;
+ 
+@@ -444,7 +423,48 @@ pub fn Server(comptime H: type) type {
+                 // Closed here rather than in stop(): until its thread exits, a
+                 // worker can still re-arm the listener in its event loop.
+                 posix.close(listener);
++                self._mut.lockUncancelable(io);
++                defer self._mut.unlock(io);
++                self._listener = null;
++            }
++        }
++
++        fn bindListener(self: *Self, io: Io) !posix.fd_t {
++            const config = self.config;
++            const address = try config.address.toPosix(io);
++            const is_unix_socket = address.any.family == posix.AF.UNIX;
++
++            const listener = blk: {
++                var sock_flags: u32 = posix.SOCK.STREAM | posix.CLOEXEC;
++                if (blockingMode() == false) sock_flags |= posix.NONBLOCK;
++
++                const proto = if (is_unix_socket) @as(u32, 0) else posix.IPPROTO.TCP;
++                break :blk try posix.socket(address.any.family, sock_flags, proto);
++            };
++
++            errdefer posix.close(listener);
++
++            if (is_unix_socket == false) {
++                try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
++            }
++
++            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
++
++            if (is_unix_socket == false and self._workers.len > 1) {
++                if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
++                    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
++                } else if (@hasDecl(posix.SO, "REUSEPORT")) {
++                    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
++                }
++            }
++
++            {
++                const socklen = address.getOsSockLen();
++                try posix.bind(listener, &address.any, socklen);
++                try posix.listen(listener, 1024); // kernel backlog
+             }
++
++            return listener;
+         }
+ 
+         pub fn listenInNewThread(self: *Self) !std.Thread {
+@@ -486,6 +506,24 @@ pub fn Server(comptime H: type) type {
+             // workers have exited.
+         }
+ 
++        /// Graceful stop: workers stop accepting (the listener itself stays open until they finish, so a copy held
++        /// elsewhere, e.g. by systemd, keeps queueing connections), requests already received are answered with
++        /// `Connection: Close`, and idle keep-alive connections are left for the peer to close. listen() returns
++        /// once every connection is gone or after `grace_s`, whichever comes first. A later stop() still cuts it short.
++        pub fn gracefulStop(self: *Self, grace_s: u32) void {
++            if (comptime blockingMode()) return self.stop();
++            const io = self.io;
++            self._mut.lockUncancelable(io);
++            defer self._mut.unlock(io);
++            if (self._listener == null) {
++                log.err("Cannot stop server gracefully, .listen() was never called", .{});
++                return;
++            }
++            self._drain_grace_s = grace_s;
++            self._draining.store(true, .release);
++            for (self._workers) |*w| w.wake();
++        }
++
+         pub fn router(self: *Self, config: RouterConfig) !*Router(H, ActionArg) {
+             // we store this in self for us when no route is found (these will
+             // still be executed).
+@@ -578,8 +616,12 @@ pub fn Server(comptime H: type) type {
+ 
+             if (conn.handover == .unknown) {
+                 // close is the default
+-                conn.handover = if (req.canKeepAlive() and conn.request_count < self._max_request_per_connection) .keepalive else .close;
++                conn.handover = if (res.keepalive and req.canKeepAlive() and conn.request_count < self._max_request_per_connection) .keepalive else .close;
+             }
++            if (conn.handover == .keepalive and self._draining.load(.acquire)) conn.handover = .close;
++            // Announce the close: a reverse proxy otherwise reuses the connection and its next request
++            // (a POST is never retried) lands on a closed socket and becomes a 502.
++            if (conn.handover == .close) res.keepalive = false;
+ 
+             res.write() catch {
+                 conn.handover = .close;
+@@ -2003,6 +2045,166 @@ test "httpz: keepalive" {
+     try t.expectString("HTTP/1.1 200 \r\nContent-Length: 19\r\n\r\nversion=v2,user=123", testReadAll(stream, &buf));
+ }
+ 
++test "httpz: last response before closing announces Connection: Close" {
++    // A reverse proxy (Caddy) reuses a connection whose close was not announced: its next request lands on a
++    // closed socket and becomes a 502 (a POST is never retried).
++    // Blocking mode closes open connections twice on stop (worker.zig): only the non-blocking server runs it.
++    if (comptime blockingMode()) return error.SkipZigTest;
++    var srv = try Server(void).init(t.io, t.allocator, .{ .address = .localhost(6011), .timeout = .{ .request_count = 3 } }, {});
++    defer srv.deinit();
++    var router = try srv.router(.{});
++    router.get("/ping", struct {
++        fn ping(_: *Request, res: *Response) !void {
++            res.body = "ok";
++        }
++    }.ping, .{});
++    const thread = try srv.listenInNewThread();
++    defer {
++        srv.stop();
++        thread.join();
++    }
++    try testing.waitForPort(6011);
++
++    const stream = testStream(6011);
++    defer stream.close(t.io);
++    var writer = stream.writer(t.io, &.{});
++    const w = &writer.interface;
++    var buf: [200]u8 = undefined;
++
++    // Every response before the close keeps the connection; the last one says so before the socket closes.
++    for (0..4) |i| {
++        try w.writeAll("GET /ping HTTP/1.1\r\n\r\n");
++        try w.flush();
++        const got = testReadAll(stream, &buf);
++        if (i > 0 and std.mem.eql(u8, got, "HTTP/1.1 200 \r\nConnection: Close\r\nContent-Length: 2\r\n\r\nok")) return;
++        try t.expectString("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok", got);
++    }
++    return error.ConnectionNeverClosed;
++}
++
++test "httpz: Connection: close from the client is honored on a reused connection" {
++    if (comptime blockingMode()) return error.SkipZigTest;
++    const stream = testStream(5993);
++    defer stream.close(t.io);
++    var writer = stream.writer(t.io, &.{});
++    const w = &writer.interface;
++    var buf: [100]u8 = undefined;
++    try w.writeAll("GET /api/v2/users/1 HTTP/1.1\r\n\r\n");
++    try w.flush();
++    try t.expectString("HTTP/1.1 200 \r\nContent-Length: 17\r\n\r\nversion=v2,user=1", testReadAll(stream, &buf));
++    try w.writeAll("GET /api/v2/users/2 HTTP/1.1\r\nConnection: close\r\n\r\n");
++    try w.flush();
++    try t.expectString("HTTP/1.1 200 \r\nConnection: Close\r\nContent-Length: 17\r\n\r\nversion=v2,user=2", testReadAll(stream, &buf));
++}
++
++test "httpz: serves on a listener it did not bind and leaves other copies listening" {
++    // systemd keeps a duplicate of the socket across restarts: stopping the server must not end it.
++    // Blocking mode shuts the listener down to unblock accept, which ends every copy: not usable this way.
++    if (comptime blockingMode()) return error.SkipZigTest;
++    const address = try Io.net.IpAddress.parse("127.0.0.1", 6012);
++    var kept = try address.listen(t.io, .{ .reuse_address = true });
++    defer kept.deinit(t.io);
++    const handed = std.c.dup(kept.socket.handle);
++    if (handed < 0) return error.DupFailed;
++
++    var srv = try Server(void).init(t.io, t.allocator, .{ .address = .localhost(6012), .listener = handed }, {});
++    defer srv.deinit();
++    var router = try srv.router(.{});
++    router.get("/ping", struct {
++        fn ping(_: *Request, res: *Response) !void {
++            res.body = "ok";
++        }
++    }.ping, .{});
++    const thread = try srv.listenInNewThread();
++    try testing.waitForPort(6012);
++    {
++        const stream = testStream(6012);
++        defer stream.close(t.io);
++        var writer = stream.writer(t.io, &.{});
++        try writer.interface.writeAll("GET /ping HTTP/1.1\r\n\r\n");
++        try writer.interface.flush();
++        var buf: [100]u8 = undefined;
++        try t.expectString("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok", testReadAll(stream, &buf));
++    }
++    srv.stop();
++    thread.join();
++
++    const late = try address.connect(t.io, .{ .mode = .stream });
++    defer late.close(t.io);
++    const accepted = try kept.accept(t.io);
++    accepted.close(t.io);
++}
++
++test "httpz: gracefulStop finishes requests, closes connections politely and keeps the listener for its other holder" {
++    if (comptime blockingMode()) return error.SkipZigTest;
++    const address = try Io.net.IpAddress.parse("127.0.0.1", 6013);
++    var kept = try address.listen(t.io, .{ .reuse_address = true });
++    defer kept.deinit(t.io);
++    const handed = std.c.dup(kept.socket.handle);
++    if (handed < 0) return error.DupFailed;
++
++    var srv = try Server(void).init(t.io, t.allocator, .{ .address = .localhost(6013), .listener = handed }, {});
++    defer srv.deinit();
++    var router = try srv.router(.{});
++    const Routes = struct {
++        fn ping(_: *Request, res: *Response) !void {
++            res.body = "ok";
++        }
++        fn slow(_: *Request, res: *Response) !void {
++            t.io.sleep(.fromMilliseconds(300), .awake) catch unreachable;
++            res.body = "ok";
++        }
++    };
++    router.get("/ping", Routes.ping, .{});
++    router.get("/slow", Routes.slow, .{});
++    const thread = try srv.listenInNewThread();
++    try testing.waitForPort(6013);
++
++    var buf: [200]u8 = undefined;
++    // Idle keep-alive connection, as a proxy leaves it.
++    const idle = testStream(6013);
++    defer idle.close(t.io);
++    var idle_writer = idle.writer(t.io, &.{});
++    try idle_writer.interface.writeAll("GET /ping HTTP/1.1\r\n\r\n");
++    try idle_writer.interface.flush();
++    try t.expectString("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok", testReadAll(idle, &buf));
++
++    // A request in progress when the drain starts.
++    const busy = try address.connect(t.io, .{ .mode = .stream });
++    defer busy.close(t.io);
++    var busy_writer = busy.writer(t.io, &.{});
++    try busy_writer.interface.writeAll("GET /slow HTTP/1.1\r\n\r\n");
++    try busy_writer.interface.flush();
++    try t.io.sleep(.fromMilliseconds(100), .awake);
++    const started = Io.Clock.awake.now(t.io);
++    srv.gracefulStop(10);
++
++    // The server closes the connection after this answer: read to the end.
++    var len: usize = 0;
++    while (true) {
++        const n = try posix.read(busy.socket.handle, buf[len..]);
++        if (n == 0) break;
++        len += n;
++    }
++    try t.expectString("HTTP/1.1 200 \r\nConnection: Close\r\nContent-Length: 2\r\n\r\nok", buf[0..len]);
++
++    // The idle connection still answers, and says it is the last answer.
++    try idle_writer.interface.writeAll("GET /ping HTTP/1.1\r\n\r\n");
++    try idle_writer.interface.flush();
++    var idle_buf: [200]u8 = undefined;
++    try t.expectString("HTTP/1.1 200 \r\nConnection: Close\r\nContent-Length: 2\r\n\r\nok", testReadAll(idle, &idle_buf));
++
++    // Both connections are closed by the server after their last answer: listen() returns long before the grace.
++    thread.join();
++    try t.expectEqual(true, started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 3_000);
++
++    // The drained server never accepted again; the other holder still gets the connection.
++    const late = try address.connect(t.io, .{ .mode = .stream });
++    defer late.close(t.io);
++    const accepted = try kept.accept(t.io);
++    accepted.close(t.io);
++}
++
+ test "httpz: route data" {
+     const stream = testStream(5992);
+     defer stream.close(t.io);
+diff --git a/src/worker.zig b/src/worker.zig
+index 0c250c3..2516147 100644
+--- a/src/worker.zig
++++ b/src/worker.zig
+@@ -339,6 +339,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+         // # of connections this worker is handling.
+         len: usize,
+ 
++        // Draining (Server.gracefulStop): no new connections; run returns when len reaches 0 or at drain_until.
++        draining: bool = false,
++        drain_until: u32 = 0,
++
+         // whether or not the worker is full (len == max_conn)
+         full: bool,
+ 
+@@ -504,6 +508,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+             self.loop.stop();
+         }
+ 
++        // Called from another thread by Server.gracefulStop: the loop notices the server's _draining flag.
++        pub fn wake(self: *Self) void {
++            self.loop.signal() catch |err| log.err("Failed to wake worker: {}", .{err});
++        }
++
+         pub fn run(self: *Self, listener: posix.fd_t, ready_sem: *Io.Semaphore) void {
+             const io = self.io;
+             var thread_pool = &self.thread_pool;
+@@ -526,6 +535,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+             var now = timestamp(io);
+             var last_timeout = now;
+             while (true) {
++                if (self.server._draining.load(.acquire)) {
++                    if (!self.draining) {
++                        self.draining = true;
++                        self.loop.pauseAccept(listener) catch {};
++                        self.drain_until = now + self.server._drain_grace_s;
++                    }
++                    if (self.len == 0 or now >= self.drain_until) return;
++                }
+                 var timeout: ?i32 = 1;
+                 if (now - last_timeout > 1) {
+ 
+@@ -536,6 +553,8 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+                     }
+                     last_timeout = now;
+                 }
++                // Draining checks its end (no connections left, or the deadline) at least once a second.
++                if (self.draining) timeout = 1;
+ 
+                 var it = self.loop.wait(timeout) catch |err| {
+                     log.err("Failed to wait on events: {}", .{err});
+@@ -560,7 +579,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+ 
+                 while (it.next()) |event| {
+                     switch (event) {
+-                        .accept => self.accept(listener, now) catch |err| {
++                        .accept => if (self.draining) {} else self.accept(listener, now) catch |err| {
+                             log.err("Failed to accept connection: {}", .{err});
+                             io.sleep(.fromMilliseconds(5), .awake) catch |err2| {
+                                 log.err("Failed to do a mini recovery sleep: {}", .{err2});
+@@ -822,6 +841,9 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+         pub fn processHTTPData(self: *Self, now: u32, conn: *Conn(WSH), thread_buf: []u8, http_conn: *HTTPConn) void {
+             metrics.request();
+             http_conn.request_count += 1;
++            // Each request decides again: the previous one's keepalive must not hide this one's Connection: close
++            // or the request_count limit.
++            http_conn.handover = .unknown;
+             self.server.handleRequest(http_conn, thread_buf);
+ 
+             var handover = http_conn.handover;
+@@ -1023,6 +1045,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+ 
+         inline fn enableListener(self: *Self, listener: posix.fd_t) void {
+             self.full = false;
++            if (self.draining) return;
+             self.loop.monitorAccept(listener) catch |err| log.err("Failed to enable monitor to listening socket: {}", .{err});
+         }
+     };
+diff --git a/src/request.zig b/src/request.zig
+index e402cca..71efc1b 100644
+--- a/src/request.zig
++++ b/src/request.zig
+@@ -756,6 +756,13 @@ pub const State = struct {
+ 
+         var len = self.len;
+         const buf = self.buf;
++        // Linha de endereço ou bloco de cabeçalhos que enche o buffer sem terminar nunca se completa. Sem esta
++        // checagem, os passos abaixo respondem "preciso de mais dados", a leitura de 0 bytes devolve false e o
++        // epoll acorda para sempre no socket não lido: 100% de CPU sem resposta (correção do autocorret, ADR 0006).
++        if (len == buf.len) {
++            metrics.headerTooBig();
++            return error.HeaderTooBig;
++        }
+         const n = try zig016HackRead(source, buf[len..]);
+         if (n == 0) {
+             return false;
+@@ -1529,6 +1536,18 @@ test "request: header too big" {
+     try expectParseError(error.HeaderTooBig, "GET / HTTP/1.1\r\nH: v\r\n\r\n", .{ .buffer_size = 23 });
+ }
+ 
++test "request: url or header block that fills the buffer without ending is HeaderTooBig, not a busy loop" {
++    // Sem a checagem, o buffer cheio fazia a leitura devolver 0 bytes e o parse responder "preciso de mais dados"
++    // para sempre: o epoll acordava no socket não lido e a thread girava a 100% (endereço de 40 KB, sem login).
++    var ctx = t.Context.init(.{ .request = .{ .buffer_size = 32 } });
++    defer ctx.deinit();
++    var reader = ctx.stream.reader(t.io, &.{});
++    const r = &reader.interface;
++    ctx.write("GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
++    try t.expectEqual(false, try ctx.conn.req_state.parse(ctx.conn, r));
++    try t.expectError(error.HeaderTooBig, ctx.conn.req_state.parse(ctx.conn, r));
++}
++
+ test "request: parse method" {
+     defer t.reset();
+     {
+diff --git a/src/worker.zig b/src/worker.zig
+index 2516147..6f805ac 100644
+--- a/src/worker.zig
++++ b/src/worker.zig
+@@ -659,24 +659,31 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+         fn swapList(self: *Self, conn: *Conn(WSH), new_state: HTTPConn.State) void {
+             const io = self.io;
+             const http_conn = conn.protocol.http;
+-            http_conn._mut.lockUncancelable(io);
+-            defer http_conn._mut.unlock(io);
+-
+-            switch (http_conn._state) {
+-                .active => self.active_list.remove(io, conn),
+-                .keepalive => self.keepalive_list.remove(io, conn),
+-                .request => self.request_list.remove(conn),
+-                .handover => self.handover_list.remove(io, conn),
+-            }
++            {
++                http_conn._mut.lockUncancelable(io);
++                defer http_conn._mut.unlock(io);
++
++                switch (http_conn._state) {
++                    .active => self.active_list.remove(io, conn),
++                    .keepalive => self.keepalive_list.remove(io, conn),
++                    .request => self.request_list.remove(conn),
++                    .handover => self.handover_list.remove(io, conn),
++                }
+ 
+-            http_conn._state = new_state;
++                http_conn._state = new_state;
+ 
+-            switch (new_state) {
+-                .active => self.active_list.insert(io, conn),
+-                .keepalive => self.keepalive_list.insert(io, conn),
+-                .request => self.request_list.insert(conn),
+-                .handover => self.handover_list.insert(io, conn),
++                switch (new_state) {
++                    .active => self.active_list.insert(io, conn),
++                    .keepalive => self.keepalive_list.insert(io, conn),
++                    .request => self.request_list.insert(conn),
++                    .handover => {},
++                }
+             }
++            // O laço de eventos libera `conn` e a HTTPConn assim que o nó aparece na lista de entrega. Inserir com o
++            // `_mut` ainda preso deixava o laço reciclar a HTTPConn antes desta thread soltar o mutex, e soltar um mutex
++            // reciclado derrubava o processo ("switch on corrupt value"; correção 4 do autocorret, ADR 0006).
++            // Nada pode tocar `conn` nem `http_conn` depois desta linha.
++            if (new_state == .handover) self.handover_list.insert(io, conn);
+         }
+ 
+         fn accept(self: *Self, listener: posix.fd_t, now: u32) !void {
+@@ -739,9 +746,13 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
+                     .protocol = .{ .http = http_conn },
+                 };
+                 self.request_list.insert(conn);
++                // Os errdefer de cima já fecham o socket e destroem `conn`; chamar disown() aqui também a destruía
++                // de novo (a mesma memória duas vezes no pool, um Conn para duas conexões vivas). Desfaz só o que
++                // este bloco fez (correção 3 do autocorret, ADR 0006).
+                 errdefer {
+-                    conn.close();
+-                    self.disown(conn);
++                    self.request_list.remove(conn);
++                    self.len -= 1;
++                    self.http_conn_pool.release(http_conn);
+                 }
+ 
+                 try self.loop.monitorRead(conn);
